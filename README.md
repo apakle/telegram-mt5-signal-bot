@@ -1,6 +1,6 @@
 # telegram-mt5-signal-bot
 
-Fully automated algorithmic trading pipeline that routes Telegram signals through an LLM parser into MetaTrader 5 for live trade execution — running headlessly 24/7 on a free Oracle ARM64 VPS.
+Fully automated algorithmic trading pipeline that routes Telegram signals through a parser into MetaTrader 5 for live trade execution — running headlessly 24/7 on a free Oracle ARM64 VPS.
 
 ```
 Telegram channel → Python (Ollama LLM) → signal.json → MT5 Expert Advisor → broker trades
@@ -21,9 +21,9 @@ Telegram channel → Python (Ollama LLM) → signal.json → MT5 Expert Advisor 
 ```
 telegram-mt5-signal-bot/
 ├── src/                          # Python signal bot scripts
-│   ├── llm_telegram_signal2json_bot.py       # PUPrime signal bot
-│   ├── llm_telegram_signal2json_bot_gold.py  # PUPrime gold signal bot
-│   └── vantage_signal_bot.py                 # Vantage signal bot
+│   ├── llm_telegram_signal2json_bot.py       # PUPrime signal zone bot
+│   ├── telegram_mt5_signal_bot_gold.py       # PUPrime gold signal bot
+│   └── telegram_mt5_signal_bot.py            # Vantage signal bot
 ├── config/
 │   └── .env.example              # Environment variable template
 ├── mql5/

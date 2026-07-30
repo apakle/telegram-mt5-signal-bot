@@ -45,7 +45,7 @@ telegram-mt5-signal-bot/
 ### 1. Clone and install dependencies
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/telegram-mt5-signal-bot.git
+git clone https://github.com/apakle/telegram-mt5-signal-bot.git
 cd telegram-mt5-signal-bot
 python3 -m venv venv
 source venv/bin/activate

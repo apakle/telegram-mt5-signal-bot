@@ -132,7 +132,7 @@ Get your Telegram API credentials at [https://my.telegram.org](https://my.telegr
 
 ## Notes
 
-- `.ex5` compiled EA files are included in `mql5/Experts/` for direct deployment to the VPS. The `.mq5` source files are included for reference and recompilation.
+- `.ex5` compiled EA files are **not** included in `mql5/Experts/`. The `.mq5` source files are provided for compilation using the MetaTrader 5 Desktop application before deployment to the VPS.
 - Telegram session files in `data/sessions/` are gitignored — generate them by running the bot once interactively.
 - Log files in `logs/` are gitignored.
 - Broker credentials are never stored in this repo — use `config/.env` (gitignored).

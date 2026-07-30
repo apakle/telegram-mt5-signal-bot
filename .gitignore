@@ -1,0 +1,46 @@
+# Environment / credentials
+config/.env*
+
+# Telegram session files
+data/sessions/*.session
+data/sessions/*.session-journal
+
+# Log files
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+env/
+
+# Python test files
+test*.py
+
+# Python Igor files
+*igor.py
+
+# Compiled MT5 EA binaries
+# (include .mq5 source, exclude .ex5 compiled — or include both, your choice)
+# Uncomment the line below to exclude compiled EAs:
+# mql5/Experts/*.ex5
+
+# MT5 profile backups
+mql5/Profiles/**/*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

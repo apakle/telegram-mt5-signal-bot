@@ -46,7 +46,6 @@ file_handler = TimedRotatingFileHandler(
     encoding="utf-8",
     utc=False              # doesn't matter much here if server is also UTC
 )
-file_handler.suffix = "%Y%m%d"
 
 logging.basicConfig(
     level=logging.INFO,

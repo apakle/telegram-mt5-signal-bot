@@ -241,6 +241,35 @@ void OnTick()
                                     ? ORDER_TYPE_BUY
                                     : ORDER_TYPE_SELL;
 
+        //--- Zone touch log: fires once when price first enters the zone
+        double currentHigh = iHigh(symbol, RejectionTF, 1);
+        double currentLow  = iLow (symbol, RejectionTF, 1);
+        double currentOpen = iOpen(symbol, RejectionTF, 1);
+        double currentClose= iClose(symbol, RejectionTF, 1);
+        bool   inZone      = (orderType == ORDER_TYPE_BUY)
+                             ? (currentLow  <= entry_max)   // BUY: low touched zone from above
+                             : (currentHigh >= entry_min);  // SELL: high touched zone from below
+
+        static bool zoneTouched[];
+        if(ArraySize(zoneTouched) != zone_count)
+        {
+            ArrayResize(zoneTouched, zone_count);
+            ArrayInitialize(zoneTouched, false);
+        }
+
+        if(inZone && !zoneTouched[i])
+        {
+            zoneTouched[i] = true;
+            PrintFormat("📍 Zone touched | Zone=%d | %s | zone=[%.2f-%.2f] | time=%s | O=%.2f H=%.2f L=%.2f C=%.2f",
+                        i + 1, order_type, entry_min, entry_max,
+                        TimeToString(iTime(symbol, RejectionTF, 1), TIME_DATE|TIME_MINUTES),
+                        currentOpen, currentHigh, currentLow, currentClose);
+        }
+        else if(!inZone)
+        {
+            zoneTouched[i] = false; // reset so re-entry into zone is logged again
+        }
+
         int confirmedBar = FindRejectionCandle(symbol, orderType, entry_min, entry_max);
 
         if(confirmedBar > 0)

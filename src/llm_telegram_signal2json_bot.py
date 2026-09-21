@@ -64,7 +64,7 @@ CHANNEL      = PeerChannel(channel_id=2386108670) # BARE PIPS GOLD VIP
 SESSION_NAME = SESSION_DIR / "session_name_gold_llm"
 
 SYMBOL       = "XAUUSD.s"
-MODEL        = "minimax-m3:cloud"
+MODEL        = "gemma4:31b:cloud"
 SIGNAL_FILE = Path("/home/ubuntu/.wine/drive_c/users/ubuntu/AppData/Roaming/MetaQuotes/Terminal/Common/Files/signal_zones.json")
 
 # ── System prompt ─────────────────────────────────────────────────────────────

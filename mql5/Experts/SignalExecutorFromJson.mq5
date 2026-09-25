@@ -179,11 +179,13 @@ bool CheckRollover(string symbol, ENUM_ORDER_TYPE orderType,
 
     if(orderType == ORDER_TYPE_BUY)
     {
+        if(low > entry_max)    return false; // [2] candle must have touched zone from below
         if(close <= entry_max) return false; // [3] must close above zone
         if(close <= open)      return false; // [4] must be bullish
     }
     else
     {
+        if(high < entry_min)   return false; // [2] candle must have touched zone from above
         if(close >= entry_min) return false; // [3] must close below zone
         if(close >= open)      return false; // [4] must be bearish
     }

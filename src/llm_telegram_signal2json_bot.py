@@ -5,7 +5,7 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from ollama import chat
+from openai import OpenAI
 from telethon import TelegramClient, events
 from telethon.tl.types import PeerChannel
 
@@ -54,18 +54,32 @@ logging.basicConfig(
 )
 logging.getLogger("telethon").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
+## Telegram
 API_ID       = int(os.getenv("API_ID"))
 API_HASH     = os.getenv("API_HASH")
 CHANNEL      = PeerChannel(channel_id=2386108670) # BARE PIPS GOLD VIP
 # CHANNEL      = PeerChannel(channel_id=2661711862) # my test channel
 SESSION_NAME = SESSION_DIR / "session_name_gold_llm"
 
+## LLM (Groq)
+BASE_URL     = "https://api.groq.com/openai/v1"
+MODEL        = "qwen/qwen3.8-27b"
+API_KEY      = os.getenv("API_KEY")
+
+llm_client = OpenAI(
+    base_url=BASE_URL,
+    api_key=API_KEY,
+    timeout=30,
+    default_headers={"Accept-Encoding": "gzip, deflate"},
+)
+
+## Symbol and path for saving signals
 SYMBOL       = "XAUUSD.s"
-MODEL        = "gemma4:31b:cloud"
-SIGNAL_FILE = Path("/home/ubuntu/.wine/drive_c/users/ubuntu/AppData/Roaming/MetaQuotes/Terminal/Common/Files/signal_zones.json")
+SIGNAL_FILE  = Path("/home/ubuntu/.wine/drive_c/users/ubuntu/AppData/Roaming/MetaQuotes/Terminal/Common/Files/signal_zones.json")
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """You are a financial signal parser. Extract trading zones from messages about buying and selling zones for a ticker.
@@ -107,14 +121,15 @@ def is_signal(text: str) -> bool:
 
 # ── Parser ────────────────────────────────────────────────────────────────────
 def parse_signal(text: str, symbol: str = SYMBOL) -> list[dict]:
-    resp = chat(
+    resp = llm_client.chat.completions.create(
         model=MODEL,
+        temperature=0,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": f"Default symbol: {symbol}\n\n{text}"},
         ],
     )
-    raw = re.sub(r"^```[a-z]*\n?|\n?```$", "", resp.message.content.strip())
+    raw = re.sub(r"^```[a-z]*\n?|\n?```$", "", resp.choices[0].message.content.strip())
     zones = json.loads(raw)
     if isinstance(zones, dict):
         zones = next((v for v in zones.values() if isinstance(v, list)), [])

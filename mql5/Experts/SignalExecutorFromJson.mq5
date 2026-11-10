@@ -1,50 +1,62 @@
 ﻿//+------------------------------------------------------------------+
-//|  SignalExecutorFromJson.mq5                                      |
-//|  Reads signal_zones.json with multiple zones, checks rejection   |
-//|  per zone based on BarePips Rejection Candle Handbook.           |
+//|  SignalExecutor.mq5                                              |
+//|  BarePips zone-based rejection EA for XAUUSD                    |
 //|                                                                  |
-//|  Two confirmation modes:                                         |
-//|  - Pin Bar  : single candle with long wick + small body          |
-//|  - Rollover : zone touched on candle A, bearish/bullish close    |
-//|               outside zone on candle B (catches Gold grind-outs) |
+//|  State machine per zone:                                         |
+//|    IDLE → TOUCHED → CONFIRMED → EXECUTED                        |
 //|                                                                  |
-//|  RequirePinBar = true  → pin bar only                           |
-//|  RequirePinBar = false → pin bar OR rollover (default)          |
+//|  Confirmation logic (M5 primary, M1 early trigger):             |
+//|    M5: first candle that closes outside zone after touch         |
+//|    M1: same rule, faster — only used if M1 confirms first       |
+//|                                                                  |
+//|  SL = 6 pts from entry, TP = 4 pts from entry                  |
 //+------------------------------------------------------------------+
 #include <JSON\index.mqh>
 
-input string          FileName           = "signal_zones.json"; // JSON file path
-input double          LotSize            = 0.01;                // Volume per trade
-input double          SL_Points          = 10.0;                // SL distance in dollars
-input double          TP_Points          = 4.0;                 // TP distance in dollars
-input ENUM_TIMEFRAMES RejectionTF        = PERIOD_M5;           // Candle timeframe (M5 or M15)
-input bool            RequirePinBar      = false;               // true = pin bar only | false = pin bar OR rollover
-input double          MaxBodyRatio       = 0.20;                // [Pin bar] Max body / total range
-input double          MinWickRatio       = 0.50;                // [Pin bar] Min rejection wick / total range
-input double          MinZonePenetration = 1.0;                 // Min points wick must enter zone
-input double          MinCandleRange     = 2.0;                 // Min total candle range (filters noise)
-input int             LookbackCandles    = 10;                  // How many closed candles to scan per tick
+//--- Inputs
+input string          FileName        = "signal_zones.json"; // JSON file
+input double          LotSize         = 0.01;                // Lot size
+input double          SL_Points       = 6.0;                 // SL distance in $
+input double          TP_Points       = 4.0;                 // TP distance in $
+input bool            UseM1Trigger    = true;                // Enable M1 early trigger
+input double          MinRangeM5      = 2.0;                 // Min M5 candle range to confirm (filters noise)
+input double          MinRangeM1      = 0.5;                 // Min M1 candle range to confirm
 
-//--- Global tracking arrays (indexed per zone, reset on new signal)
-datetime activeSignalTime = 0;
-bool     zoneExecuted[];   // zone already traded
-bool     zoneTouched[];    // zone was tested by price (enables rollover)
+//--- Zone states
+enum ZONE_STATE
+{
+    STATE_IDLE      = 0, // zone not yet reached
+    STATE_TOUCHED   = 1, // price wicked into zone, waiting for close outside
+    STATE_EXECUTED  = 2  // trade placed, zone done
+};
+
+//--- Per-zone tracking
+datetime  activeSignalTime = 0;
+int       zoneCount        = 0;
+ZONE_STATE zoneState[];   // state machine per zone
+string    zoneSymbol[];
+string    zoneOrderType[];
+double    zoneEntryMin[];
+double    zoneEntryMax[];
+datetime  zoneTouchTime[]; // open time of the M5 candle that touched the zone
+bool      newM5Bar = false; // true on first tick of a new M5 bar
+bool      newM1Bar = false; // true on first tick of a new M1 bar
 
 //+------------------------------------------------------------------+
-//| Read JSON file into string                                        |
+//| Read JSON file                                                    |
 //+------------------------------------------------------------------+
 bool ReadSignal(string fileName, string &json_signal)
 {
-    static datetime lastHandleErrorPrint = 0;
-    static datetime lastEmptyPrint       = 0;
+    static datetime lastErrorPrint = 0;
+    static datetime lastEmptyPrint = 0;
 
     int handle = FileOpen(fileName, FILE_READ|FILE_TXT|FILE_ANSI|FILE_COMMON);
     if(handle == INVALID_HANDLE)
     {
-        if(TimeCurrent() - lastHandleErrorPrint >= 120)
+        if(TimeCurrent() - lastErrorPrint >= 120)
         {
-            Print("❌ Failed to open JSON file: ", fileName, " | Error: ", GetLastError());
-            lastHandleErrorPrint = TimeCurrent();
+            Print("❌ Cannot open JSON: ", fileName, " error=", GetLastError());
+            lastErrorPrint = TimeCurrent();
         }
         return false;
     }
@@ -58,170 +70,208 @@ bool ReadSignal(string fileName, string &json_signal)
     {
         if(TimeCurrent() - lastEmptyPrint >= 900)
         {
-            Print("⚠️ JSON file empty or corrupted");
+            Print("⚠️ JSON empty or corrupted");
             lastEmptyPrint = TimeCurrent();
         }
         return false;
     }
-
     return true;
 }
 
 //+------------------------------------------------------------------+
-//| Place a single market order                                       |
+//| Place market order                                                |
 //+------------------------------------------------------------------+
-void PlaceOrder(string symbol, ENUM_ORDER_TYPE orderType, double sl, double tp, int zoneIndex)
+void PlaceOrder(int zoneIdx)
 {
+    string          symbol    = zoneSymbol[zoneIdx];
+    ENUM_ORDER_TYPE orderType = (StringFind(zoneOrderType[zoneIdx], "BUY") != -1)
+                                ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+
     double ask   = SymbolInfoDouble(symbol, SYMBOL_ASK);
     double bid   = SymbolInfoDouble(symbol, SYMBOL_BID);
     double price = (orderType == ORDER_TYPE_BUY) ? ask : bid;
+    double sl    = (orderType == ORDER_TYPE_BUY) ? price - SL_Points : price + SL_Points;
+    double tp    = (orderType == ORDER_TYPE_BUY) ? price + TP_Points : price - TP_Points;
 
-    MqlTradeRequest request;
-    MqlTradeResult  result;
-    ZeroMemory(request);
-    ZeroMemory(result);
+    MqlTradeRequest req; MqlTradeResult res;
+    ZeroMemory(req); ZeroMemory(res);
 
-    request.action       = TRADE_ACTION_DEAL;
-    request.symbol       = symbol;
-    request.volume       = LotSize;
-    request.type         = orderType;
-    request.price        = price;
-    request.sl           = sl;
-    request.tp           = tp;
-    request.magic        = 0;
-    request.comment      = "Zone" + IntegerToString(zoneIndex + 1);
-    request.deviation    = 20;
-    request.type_time    = ORDER_TIME_GTC;
-    request.type_filling = ORDER_FILLING_IOC;
+    req.action       = TRADE_ACTION_DEAL;
+    req.symbol       = symbol;
+    req.volume       = LotSize;
+    req.type         = orderType;
+    req.price        = price;
+    req.sl           = sl;
+    req.tp           = tp;
+    req.magic        = 0;
+    req.comment      = "Zone" + IntegerToString(zoneIdx + 1);
+    req.deviation    = 20;
+    req.type_time    = ORDER_TIME_GTC;
+    req.type_filling = ORDER_FILLING_IOC;
 
-    if(!OrderSend(request, result))
-        PrintFormat("❌ OrderSend failed | Zone=%d | retcode=%d", zoneIndex + 1, result.retcode);
+    if(!OrderSend(req, res))
+        PrintFormat("❌ OrderSend failed | Zone=%d | retcode=%d", zoneIdx + 1, res.retcode);
     else
         PrintFormat("✅ Order placed | Zone=%d | %s | price=%.2f | SL=%.2f | TP=%.2f | ticket=%I64d",
-                    zoneIndex + 1,
-                    (orderType == ORDER_TYPE_BUY) ? "BUY" : "SELL",
-                    price, sl, tp, result.order);
+                    zoneIdx + 1, zoneOrderType[zoneIdx], price, sl, tp, res.order);
 }
 
 //+------------------------------------------------------------------+
-//| MODE 1 — Pin bar                                                 |
-//|                                                                  |
-//| Single candle with all of:                                       |
-//|  1. Range >= MinCandleRange                                      |
-//|  2. Wick entered zone by >= MinZonePenetration pts               |
-//|  3. Closed clearly outside the zone                             |
-//|  4. Directional: bullish for BUY, bearish for SELL              |
-//|  5. Body <= MaxBodyRatio * range                                 |
-//|  6. Rejection wick >= MinWickRatio * range                      |
+//| Check if price wicked into zone on this candle                   |
 //+------------------------------------------------------------------+
-bool CheckPinBar(string symbol, ENUM_ORDER_TYPE orderType,
-                 double entry_min, double entry_max, int bar)
+bool CandleTouchedZone(string symbol, ENUM_TIMEFRAMES tf, int bar,
+                       ENUM_ORDER_TYPE orderType, double entry_min, double entry_max)
 {
-    double low   = iLow  (symbol, RejectionTF, bar);
-    double high  = iHigh (symbol, RejectionTF, bar);
-    double open  = iOpen (symbol, RejectionTF, bar);
-    double close = iClose(symbol, RejectionTF, bar);
+    double high = iHigh(symbol, tf, bar);
+    double low  = iLow (symbol, tf, bar);
 
-    double totalRange = high - low;
-    if(totalRange < MinCandleRange)              return false; // [1]
+    // Candle must overlap the zone. A candle fully beyond the zone is NOT a touch.
+    return (low <= entry_max && high >= entry_min);
+}
 
-    double bodyRatio = MathAbs(close - open) / totalRange;
-    if(bodyRatio > MaxBodyRatio)                 return false; // [5]
+//+------------------------------------------------------------------+
+//| Check if candle closed back outside zone (confirmation)          |
+//| For SELL: close < entry_min AND bearish                         |
+//| For BUY:  close > entry_max AND bullish                         |
+//+------------------------------------------------------------------+
+bool CandleConfirmsRejection(string symbol, ENUM_TIMEFRAMES tf, int bar,
+                              ENUM_ORDER_TYPE orderType,
+                              double entry_min, double entry_max,
+                              double minRange)
+{
+    double high  = iHigh (symbol, tf, bar);
+    double low   = iLow  (symbol, tf, bar);
+    double open  = iOpen (symbol, tf, bar);
+    double close = iClose(symbol, tf, bar);
+
+    if((high - low) < minRange) return false; // ignore noise candles
 
     if(orderType == ORDER_TYPE_BUY)
     {
-        if(low > entry_max)                      return false; // [2] no touch
-        if(entry_max - low < MinZonePenetration) return false; // [2] too shallow
-        if(close <= entry_max)                   return false; // [3] closed inside zone
-        if(close <= open)                        return false; // [4] not bullish
-        double lowerWick = MathMin(open, close) - low;
-        if(lowerWick / totalRange < MinWickRatio) return false; // [6]
+        // Wick into zone + bullish close above zone
+        if(low > entry_max)    return false; // didn't touch zone
+        if(close <= entry_max) return false; // didn't close above zone
+        if(close <= open)      return false; // not bullish
     }
     else
     {
-        if(high < entry_min)                     return false; // [2] no touch
-        if(high - entry_min < MinZonePenetration) return false; // [2] too shallow
-        if(close >= entry_min)                   return false; // [3] closed inside zone
-        if(close >= open)                        return false; // [4] not bearish
-        double upperWick = high - MathMax(open, close);
-        if(upperWick / totalRange < MinWickRatio) return false; // [6]
+        // Wick into zone + bearish close below zone
+        if(high < entry_min)   return false; // didn't touch zone
+        if(close >= entry_min) return false; // didn't close below zone
+        if(close >= open)      return false; // not bearish
     }
 
     return true;
 }
 
 //+------------------------------------------------------------------+
-//| MODE 2 — Rollover                                                |
-//|                                                                  |
-//| Two-candle confirmation for gradual rejections (common on Gold). |
-//| Candle A (any earlier bar): wick entered the zone               |
-//| Candle B (bar being checked): directional close outside zone    |
-//|                                                                  |
-//| Rules for candle B:                                              |
-//|  1. Zone was previously touched (Candle A already logged)       |
-//|  2. Range >= MinCandleRange                                      |
-//|  3. Closed clearly outside the zone                             |
-//|  4. Directional: bullish for BUY, bearish for SELL              |
+//| Process one zone through the state machine                       |
 //+------------------------------------------------------------------+
-bool CheckRollover(string symbol, ENUM_ORDER_TYPE orderType,
-                   double entry_min, double entry_max,
-                   int bar, bool zoneWasTouched)
+void ProcessZone(int i)
 {
-    if(!zoneWasTouched) return false; // [1] zone must have been tested first
+    string          symbol    = zoneSymbol[i];
+    ENUM_ORDER_TYPE orderType = (StringFind(zoneOrderType[i], "BUY") != -1)
+                                ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+    double entry_min = zoneEntryMin[i];
+    double entry_max = zoneEntryMax[i];
 
-    double low   = iLow  (symbol, RejectionTF, bar);
-    double high  = iHigh (symbol, RejectionTF, bar);
-    double open  = iOpen (symbol, RejectionTF, bar);
-    double close = iClose(symbol, RejectionTF, bar);
-
-    double totalRange = high - low;
-    if(totalRange < MinCandleRange) return false; // [2]
-
-    if(orderType == ORDER_TYPE_BUY)
+    //------------------------------------------------------------------
+    // STATE: IDLE — watch for zone touch on last closed M5 candle
+    //------------------------------------------------------------------
+    if(zoneState[i] == STATE_IDLE)
     {
-        if(low > entry_max)    return false; // [2] candle must have touched zone from below
-        if(close <= entry_max) return false; // [3] must close above zone
-        if(close <= open)      return false; // [4] must be bullish
-    }
-    else
-    {
-        if(high < entry_min)   return false; // [2] candle must have touched zone from above
-        if(close >= entry_min) return false; // [3] must close below zone
-        if(close >= open)      return false; // [4] must be bearish
+        if(!newM5Bar) return; // evaluate once per closed M5 candle
+        if(CandleTouchedZone(symbol, PERIOD_M5, 1, orderType, entry_min, entry_max))
+        {
+            zoneState[i]     = STATE_TOUCHED;
+            zoneTouchTime[i] = iTime(symbol, PERIOD_M5, 1);
+
+            double o = iOpen (symbol, PERIOD_M5, 1);
+            double h = iHigh (symbol, PERIOD_M5, 1);
+            double l = iLow  (symbol, PERIOD_M5, 1);
+            double c = iClose(symbol, PERIOD_M5, 1);
+
+            PrintFormat("📍 Zone touched [M5] | Zone=%d | %s | zone=[%.2f-%.2f] | time=%s | O=%.2f H=%.2f L=%.2f C=%.2f",
+                        i + 1, zoneOrderType[i], entry_min, entry_max,
+                        TimeToString(iTime(symbol, PERIOD_M5, 1), TIME_DATE|TIME_MINUTES),
+                        o, h, l, c);
+
+            // Also check if the touch candle itself already confirms (pin bar on M5)
+            if(CandleConfirmsRejection(symbol, PERIOD_M5, 1, orderType,
+                                       entry_min, entry_max, MinRangeM5))
+            {
+                PrintFormat("✅ M5 pin bar on touch candle | Zone=%d | Entering...", i + 1);
+                PlaceOrder(i);
+                zoneState[i] = STATE_EXECUTED;
+            }
+        }
+        return;
     }
 
-    return true;
+    //------------------------------------------------------------------
+    // STATE: TOUCHED — wait for a candle to close outside the zone
+    //------------------------------------------------------------------
+    if(zoneState[i] == STATE_TOUCHED)
+    {
+        // --- M1 early trigger (bar[1] = last closed M1 candle)
+        if(UseM1Trigger && newM1Bar && iTime(symbol, PERIOD_M1, 1) >= zoneTouchTime[i] + 300)
+        {
+            if(CandleConfirmsRejection(symbol, PERIOD_M1, 1, orderType,
+                                       entry_min, entry_max, MinRangeM1))
+            {
+                double o = iOpen (symbol, PERIOD_M1, 1);
+                double h = iHigh (symbol, PERIOD_M1, 1);
+                double l = iLow  (symbol, PERIOD_M1, 1);
+                double c = iClose(symbol, PERIOD_M1, 1);
+
+                PrintFormat("✅ M1 rejection confirmed | Zone=%d | %s | zone=[%.2f-%.2f] | time=%s | O=%.2f H=%.2f L=%.2f C=%.2f",
+                            i + 1, zoneOrderType[i], entry_min, entry_max,
+                            TimeToString(iTime(symbol, PERIOD_M1, 1), TIME_DATE|TIME_MINUTES),
+                            o, h, l, c);
+                PlaceOrder(i);
+                zoneState[i] = STATE_EXECUTED;
+                return;
+            }
+        }
+
+        // --- M5 primary confirmation (bar[1] = last closed M5 candle)
+        if(newM5Bar && iTime(symbol, PERIOD_M5, 1) > zoneTouchTime[i] &&
+           CandleConfirmsRejection(symbol, PERIOD_M5, 1, orderType,
+                                   entry_min, entry_max, MinRangeM5))
+        {
+            double o = iOpen (symbol, PERIOD_M5, 1);
+            double h = iHigh (symbol, PERIOD_M5, 1);
+            double l = iLow  (symbol, PERIOD_M5, 1);
+            double c = iClose(symbol, PERIOD_M5, 1);
+
+            PrintFormat("✅ M5 rejection confirmed | Zone=%d | %s | zone=[%.2f-%.2f] | time=%s | O=%.2f H=%.2f L=%.2f C=%.2f",
+                        i + 1, zoneOrderType[i], entry_min, entry_max,
+                        TimeToString(iTime(symbol, PERIOD_M5, 1), TIME_DATE|TIME_MINUTES),
+                        o, h, l, c);
+            PlaceOrder(i);
+            zoneState[i] = STATE_EXECUTED;
+            return;
+        }
+
+        // --- Guard: if price has moved far away from zone, reset to IDLE
+        // This prevents stale TOUCHED state from triggering on a much later candle
+        double currentPrice = (orderType == ORDER_TYPE_BUY)
+                              ? SymbolInfoDouble(symbol, SYMBOL_ASK)
+                              : SymbolInfoDouble(symbol, SYMBOL_BID);
+        double distanceFromZone = (orderType == ORDER_TYPE_BUY)
+                                  ? (entry_min - currentPrice)   // how far below zone BUY is
+                                  : (currentPrice - entry_max);  // how far above zone SELL is
+
+        if(distanceFromZone > 20.0) // price moved 20+ pts away — zone is no longer relevant
+        {
+            PrintFormat("🔄 Zone reset (price moved away) | Zone=%d | distance=%.2f pts", i + 1, distanceFromZone);
+            zoneState[i] = STATE_IDLE;
+        }
+    }
 }
 
 //+------------------------------------------------------------------+
-//| Scan lookback window for first confirming candle                 |
-//| Pin bar is checked first; rollover only if RequirePinBar=false  |
-//| Returns bar index on match, -1 if none found                    |
-//| outMode set to "PinBar" or "Rollover" for logging               |
-//+------------------------------------------------------------------+
-int FindConfirmation(string symbol, ENUM_ORDER_TYPE orderType,
-                     double entry_min, double entry_max,
-                     bool zoneWasTouched, string &outMode)
-{
-    for(int bar = 1; bar <= LookbackCandles; bar++)
-    {
-        if(CheckPinBar(symbol, orderType, entry_min, entry_max, bar))
-        {
-            outMode = "PinBar";
-            return bar;
-        }
-        if(!RequirePinBar &&
-           CheckRollover(symbol, orderType, entry_min, entry_max, bar, zoneWasTouched))
-        {
-            outMode = "Rollover";
-            return bar;
-        }
-    }
-    return -1;
-}
-
-//+------------------------------------------------------------------+
-//| Expert tick function                                              |
+//| OnTick                                                            |
 //+------------------------------------------------------------------+
 void OnTick()
 {
@@ -238,118 +288,73 @@ void OnTick()
     JSON::Array* zones = obj.getArray("zones");
     if(zones == NULL) { delete obj; return; }
 
-    int zone_count = zones.getLength();
+    int count = zones.getLength();
 
-    //--- New signal: reset all tracking arrays
+    //--- New signal: reinitialise all arrays
     if(signalTime > activeSignalTime)
     {
-        PrintFormat("🆕 New signal (%s) | %d zones | TF=%s | Mode=%s | Lookback=%d bars",
-                    timestamp_str, zone_count, EnumToString(RejectionTF),
-                    RequirePinBar ? "PinBar only" : "PinBar + Rollover",
-                    LookbackCandles);
+        PrintFormat("🆕 New signal (%s) | %d zones | SL=%.1f | TP=%.1f | M1trigger=%s",
+                    timestamp_str, count, SL_Points, TP_Points,
+                    UseM1Trigger ? "ON" : "OFF");
+
         activeSignalTime = signalTime;
-        ArrayResize(zoneExecuted, zone_count); ArrayInitialize(zoneExecuted, false);
-        ArrayResize(zoneTouched,  zone_count); ArrayInitialize(zoneTouched,  false);
-    }
+        zoneCount        = count;
 
-    //--- Safety resize
-    if(ArraySize(zoneExecuted) != zone_count)
-    {
-        ArrayResize(zoneExecuted, zone_count); ArrayInitialize(zoneExecuted, false);
-        ArrayResize(zoneTouched,  zone_count); ArrayInitialize(zoneTouched,  false);
-    }
+        ArrayResize(zoneState,     count); ArrayInitialize(zoneState,     STATE_IDLE);
+        ArrayResize(zoneSymbol,    count);
+        ArrayResize(zoneOrderType, count);
+        ArrayResize(zoneEntryMin,  count);
+        ArrayResize(zoneEntryMax,  count);
+        ArrayResize(zoneTouchTime, count); ArrayInitialize(zoneTouchTime, 0);
 
-    //--- Iterate each zone
-    for(int i = 0; i < zone_count; i++)
-    {
-        if(zoneExecuted[i]) continue;
-
-        JSON::Object* zone = zones.getObject(i);
-        if(zone == NULL) continue;
-
-        string  symbol     = zone.getString("symbol");
-        string  order_type = zone.getString("order_type");
-        double  entry_min  = zone.getNumber("entry_min");
-        double  entry_max  = zone.getNumber("entry_max");
-
-        ENUM_ORDER_TYPE orderType = (StringFind(order_type, "BUY") != -1)
-                                    ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-
-        //--- Check if last closed candle touched the zone
-        double cHigh  = iHigh (symbol, RejectionTF, 1);
-        double cLow   = iLow  (symbol, RejectionTF, 1);
-        double cOpen  = iOpen (symbol, RejectionTF, 1);
-        double cClose = iClose(symbol, RejectionTF, 1);
-
-        bool inZone = (orderType == ORDER_TYPE_BUY)
-                      ? (cLow  <= entry_max)
-                      : (cHigh >= entry_min);
-
-        //--- Log first zone touch; keep zoneTouched=true once set
-        if(inZone && !zoneTouched[i])
+        for(int i = 0; i < count; i++)
         {
-            zoneTouched[i] = true;
-            PrintFormat("📍 Zone touched | Zone=%d | %s | zone=[%.2f-%.2f] | time=%s | O=%.2f H=%.2f L=%.2f C=%.2f",
-                        i + 1, order_type, entry_min, entry_max,
-                        TimeToString(iTime(symbol, RejectionTF, 1), TIME_DATE|TIME_MINUTES),
-                        cOpen, cHigh, cLow, cClose);
-        }
-
-        //--- Look for confirmation (pin bar first, then rollover)
-        string confirmMode = "";
-        int confirmedBar = FindConfirmation(symbol, orderType, entry_min, entry_max,
-                                            zoneTouched[i], confirmMode);
-
-        if(confirmedBar > 0)
-        {
-            double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-            double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-
-            double sl, tp;
-            if(orderType == ORDER_TYPE_BUY)
-            {
-                sl = ask - SL_Points;
-                tp = ask + TP_Points;
-            }
-            else
-            {
-                sl = bid + SL_Points;
-                tp = bid - TP_Points;
-            }
-
-            //--- Log confirming candle details
-            double rLow   = iLow  (symbol, RejectionTF, confirmedBar);
-            double rHigh  = iHigh (symbol, RejectionTF, confirmedBar);
-            double rOpen  = iOpen (symbol, RejectionTF, confirmedBar);
-            double rClose = iClose(symbol, RejectionTF, confirmedBar);
-            double range  = rHigh - rLow;
-            double body   = MathAbs(rClose - rOpen);
-
-            PrintFormat("✅ %s confirmed | Zone=%d | %s | zone=[%.2f-%.2f] | bar[%d] time=%s | O=%.2f H=%.2f L=%.2f C=%.2f | body=%.0f%% range=%.2f",
-                        confirmMode, i + 1, order_type, entry_min, entry_max, confirmedBar,
-                        TimeToString(iTime(symbol, RejectionTF, confirmedBar), TIME_DATE|TIME_MINUTES),
-                        rOpen, rHigh, rLow, rClose,
-                        (body / range) * 100, range);
-
-            PlaceOrder(symbol, orderType, sl, tp, i);
-            zoneExecuted[i] = true;
+            JSON::Object* z = zones.getObject(i);
+            if(z == NULL) continue;
+            zoneSymbol[i]    = z.getString("symbol");
+            zoneOrderType[i] = z.getString("order_type");
+            zoneEntryMin[i]  = z.getNumber("entry_min");
+            zoneEntryMax[i]  = z.getNumber("entry_max");
+            PrintFormat("   Zone %d | %s | %s | [%.2f - %.2f]",
+                        i + 1, zoneSymbol[i], zoneOrderType[i],
+                        zoneEntryMin[i], zoneEntryMax[i]);
         }
     }
 
-    //--- Periodic status log every 15 minutes
+    //--- Detect new closed bars (state machine runs once per bar, not per tick)
+    string refSym = (count > 0) ? zoneSymbol[0] : _Symbol;
+    static datetime lastM5Bar = 0, lastM1Bar = 0;
+    datetime m5 = iTime(refSym, PERIOD_M5, 0);
+    datetime m1 = iTime(refSym, PERIOD_M1, 0);
+    newM5Bar = (m5 != lastM5Bar);
+    newM1Bar = (m1 != lastM1Bar);
+    lastM5Bar = m5;
+    lastM1Bar = m1;
+
+    //--- Run state machine for each pending zone
+    for(int i = 0; i < zoneCount; i++)
+    {
+        if(zoneState[i] == STATE_EXECUTED) continue;
+        ProcessZone(i);
+    }
+
+    //--- Periodic status log every 15 min
     static datetime lastPrintTime = 0;
     if(TimeCurrent() - lastPrintTime >= 900)
     {
         int pending = 0;
-        for(int i = 0; i < zone_count; i++)
-            if(!zoneExecuted[i]) pending++;
+        for(int i = 0; i < zoneCount; i++)
+            if(zoneState[i] != STATE_EXECUTED) pending++;
 
-        PrintFormat("⏳ Watching | %s | %d/%d zones pending | TF=%s | Mode=%s | MaxBody=%.0f%% MinWick=%.0f%% MinPen=%.1f MinRange=%.1f Lookback=%d",
-                    timestamp_str, pending, zone_count,
-                    EnumToString(RejectionTF),
-                    RequirePinBar ? "PinBar" : "PinBar+Rollover",
-                    MaxBodyRatio * 100, MinWickRatio * 100,
-                    MinZonePenetration, MinCandleRange, LookbackCandles);
+        string stateStr = "";
+        for(int i = 0; i < zoneCount; i++)
+        {
+            string s = (zoneState[i] == STATE_IDLE)     ? "IDLE"
+                     : (zoneState[i] == STATE_TOUCHED)  ? "TOUCHED"
+                     : "DONE";
+            stateStr += "Z" + IntegerToString(i+1) + ":" + s + " ";
+        }
+        PrintFormat("⏳ %s | %d/%d pending | %s", timestamp_str, pending, zoneCount, stateStr);
         lastPrintTime = TimeCurrent();
     }
 
